@@ -111,13 +111,16 @@ class UPAuthenticator(BaseAuthenticator):
         # authentication request, so we allow it in non-strict mode.
         VER = await self.wf_readexactly(1)
         cond1 = VER == b"\x01"
+        # check if the version is 5 and the server is not in strict mode
         cond2 = VER == b"\x05" and not self.config.STRICT
         if not (cond1 or cond2):
+            # send the response to the client, indicate that the server does not support the version
             self.write(b"\x01\x01")
             raise AuthenticationError(
                 f"Received unsupported user/password authentication version {VER}"
             )
 
+        # username and password authentication
         ULEN = int.from_bytes(await self.wf_readexactly(1), "big")
         UNAME = (await self.wf_readexactly(ULEN)).decode("ASCII")
         PLEN = int.from_bytes(await self.stream_reader.readexactly(1), "big")

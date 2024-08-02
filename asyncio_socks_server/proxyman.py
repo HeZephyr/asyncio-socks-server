@@ -5,6 +5,10 @@ from asyncio_socks_server.protocols import LocalTCP
 
 
 class ProxyMan:
+    """
+    A class to manage the proxy server.
+    """
+     
     def __init__(self, config: Config):
         self.config = config
         self.loop = asyncio.get_event_loop()

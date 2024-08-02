@@ -32,13 +32,13 @@ class LocalTCP(asyncio.Protocol):
 
     def __init__(self, config: Config):
         self.config = config
-        self.stage = None
-        self.transport = None
-        self.remote_tcp = None
-        self.local_udp = None
-        self.peername = None
-        self.stream_reader = StreamReader()
-        self.negotiate_task = None
+        self.stage = None               # stage of the current connection
+        self.transport = None           # transport object
+        self.remote_tcp = None          # remote TCP connection
+        self.local_udp = None           # local UDP connection
+        self.peername = None            # peername of the connection
+        self.stream_reader = StreamReader() # stream reader object, used to read data from the connection
+        self.negotiate_task = None      # coroutine object for negotiation
         self.is_closing = False
         self.__init_authenticator_cls()
 
@@ -47,28 +47,35 @@ class LocalTCP(asyncio.Protocol):
             if cls.METHOD == self.config.AUTH_METHOD:
                 self.authenticator_cls = cls
 
+    # async read exactly n bytes
     async def wf_readexactly(self, n):
         return await asyncio.wait_for(
             self.stream_reader.readexactly(n), timeout=self.config.SOCKET_TIMEOUT
         )
 
+    # async read until a specific string is found
     async def wf_readuntil(self, s):
         return await asyncio.wait_for(
             self.stream_reader.readuntil(s), timeout=self.config.SOCKET_TIMEOUT
         )
 
+    # write data to the transport object
     def write(self, data):
         if not self.transport.is_closing():
             self.transport.write(data)
 
     def connection_made(self, transport):
+        # save the transport object and peername
         self.transport = transport
         self.peername = transport.get_extra_info("peername")
         self.stream_reader.set_transport(transport)
+
+        # create a task for negotiation
         loop = asyncio.get_event_loop()
         self.negotiate_task = loop.create_task(self.negotiate_misc())
         self.stage = self.STAGE_NEGOTIATE
 
+        # record the connection in the access log
         self.config.ACCESS_LOG and access_logger.debug(
             f"Made LocalTCP connection from {self.peername}"
         )
@@ -79,6 +86,7 @@ class LocalTCP(asyncio.Protocol):
             VER = int.from_bytes(await self.wf_readexactly(1), "big")
             await self.validate(VER)
             if VER == 5:
+                # handle the negotiation for socks5
                 await self.negotiate_socks5()
             elif VER == 4 and self.authenticator_cls == NoAuthenticator:
                 await self.negotiate_socks4()
@@ -92,14 +100,17 @@ class LocalTCP(asyncio.Protocol):
         if self.config.NETWORKS is None or len(self.config.NETWORKS) <= 0:
             return
         ip_addr = ipaddress.ip_address(self.peername[0])
+        # iterate through the configured networks and check if the IP address is allowed
         for network in self.config.NETWORKS:
             net = ipaddress.ip_network(network, strict=False)
             if ip_addr in net:
                 return
+        # If the IP is not allowed, send an appropriate response based on the version
         if ver == 5:
             self.transport.write(self.gen_socks5_reply(Socks5Rep.ADDRESS_NOT_ALLOWED))
         elif ver == 4:
             self.transport.write(self.gen_socks4_reply(Socks4Rep.ADDRESS_NOT_ALLOWED))
+        # Raise an exception indicating that the address is not allowed
         raise NoAddressAllowed(f"Address {self.peername[0]} is not allowed") from None
 
     @staticmethod
@@ -110,6 +121,13 @@ class LocalTCP(asyncio.Protocol):
     ) -> bytes:
         """Generate reply for socks5 negotiation."""
 
+        # +----+--------+----------+--------+
+        # |VER |  REP   |   RSV    |  ATYP  |
+        # +----+--------+----------+--------+
+        # |  1 |   1    |    1     |    1   |
+        # +----+--------+----------+--------+
+        # |    BND_ADDR    |    BND_PORT    |
+        # +----------------+----------------+
         VER, RSV = b"\x05", b"\x00"
         ATYP = get_socks_atyp_from_host(bind_host)
         if ATYP == SocksAtyp.IPV4:
@@ -118,8 +136,8 @@ class LocalTCP(asyncio.Protocol):
             BND_ADDR = inet_pton(AF_INET6, bind_host)
         else:
             BND_ADDR = len(bind_host).to_bytes(2, "big") + bind_host.encode("UTF-8")
-        REP = rep.to_bytes(1, "big")
-        ATYP = ATYP.to_bytes(1, "big")
+        REP = rep.to_bytes(1, "big")    # convert the reply to bytes
+        ATYP = ATYP.to_bytes(1, "big")  # the ip type, 1 for ipv4, 3 for domain, 4 for ipv6
         BND_PORT = int(bind_port).to_bytes(2, "big")
         return VER + REP + RSV + ATYP + BND_ADDR + BND_PORT
 
@@ -164,6 +182,7 @@ class LocalTCP(asyncio.Protocol):
         # | 1  |  1  | X'00' |  1   | Variable |    2     |
         # +----+-----+-------+------+----------+----------+
         VER, CMD, RSV, ATYP = await self.wf_readexactly(4)
+        # according the ip type to get the destination address
         if ATYP == SocksAtyp.IPV4:
             DST_ADDR = inet_ntop(AF_INET, await self.wf_readexactly(4))
         elif ATYP == SocksAtyp.DOMAIN:
@@ -192,11 +211,14 @@ class LocalTCP(asyncio.Protocol):
             raise NoCommandAllowed(f"Unsupported CMD value: {CMD}")
 
     async def socks5_connect(self, dst_addr, dst_port):
+        """Establish a TCP connection with the destination address."""
         try:
             loop = asyncio.get_event_loop()
+            # create a connnection task, indicating the remote TCP connection
             task = loop.create_connection(
                 lambda: RemoteTCP(self, self.config), dst_addr, dst_port
             )
+            # try to establish the connection, wait for 10
             remote_tcp_transport, remote_tcp = await asyncio.wait_for(task, 10)
         except ConnectionRefusedError:
             self.write(self.gen_socks5_reply(Socks5Rep.CONNECTION_REFUSED))
@@ -208,6 +230,7 @@ class LocalTCP(asyncio.Protocol):
             self.write(self.gen_socks5_reply(Socks5Rep.GENERAL_SOCKS_SERVER_FAILURE))
             raise CommandExecError("General socks server failure occurred")
         else:
+            # if success, get the bind address and port, and send the reply to the client
             self.remote_tcp = remote_tcp
             bind_addr, bind_port = remote_tcp_transport.get_extra_info("sockname")
             self.write(self.gen_socks5_reply(Socks5Rep.SUCCEEDED, bind_addr, bind_port))
@@ -219,8 +242,10 @@ class LocalTCP(asyncio.Protocol):
             )
 
     async def socks5_udp_associate(self, dst_addr, dst_port):
+        """Establish a UDP relay with the destination address. allow the client to send UDP packets."""
         try:
             loop = asyncio.get_event_loop()
+            # create a datagram endpoint task, indicating the local UDP connection
             task = loop.create_datagram_endpoint(
                 lambda: LocalUDP((dst_addr, dst_port), self.config),
                 local_addr=("0.0.0.0", 0),
@@ -233,6 +258,8 @@ class LocalTCP(asyncio.Protocol):
             self.local_udp = local_udp
             bind_addr, bind_port = local_udp_transport.get_extra_info("sockname")
             self.write(self.gen_socks5_reply(Socks5Rep.SUCCEEDED, bind_addr, bind_port))
+
+            # update the stage to indicate that the UDP associate is established
             self.stage = self.STAGE_UDP_ASSOCIATE
 
             self.config.ACCESS_LOG and access_logger.info(
@@ -249,17 +276,19 @@ class LocalTCP(asyncio.Protocol):
         """Generate reply for socks4 negotiation."""
 
         VER = b"\x00"
-        CD = rep.to_bytes(1, "big")
+        CD = rep.to_bytes(1, "big") # reply code
         DST_IP = inet_pton(AF_INET, dst_ip)
         DST_PORT = int(dst_port).to_bytes(2, "big")
         return VER + CD + DST_PORT + DST_IP
 
     async def negotiate_socks4(self):
+        # parse the socks4 request
         CMD = int.from_bytes(await self.wf_readexactly(1), "big")
         DST_PORT = int.from_bytes(await self.wf_readexactly(2), "big")
         DST_ADDR = inet_ntop(AF_INET, await self.wf_readexactly(4))
         USERID = (await self.wf_readuntil(b"\x00"))[:-1]
 
+        # check if the destination address is a placeholder
         socks4a_placeholders = ipaddress.IPv4Network("0.0.0.0/24")
         if ipaddress.ip_address(DST_ADDR) in socks4a_placeholders:
             DST_ADDR = (await self.wf_readuntil(b"\x00"))[:-1].decode()
